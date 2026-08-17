@@ -1,184 +1,212 @@
 # gemini-key-rotator
 
-Round-robin Gemini API key rotation with cooldown-based rate-limit handling.
-
-When a key hits a rate limit, it's put in a timed cooldown instead of being
-permanently dropped. The rotator moves to the next available key automatically.
-Once the cooldown expires, the key is back in rotation.
-
-No dependencies beyond the standard library.
+Gemini API key rotation with proactive rate-limit avoidance, exponential backoff, and optional persistent suspension tracking.
 
 ---
 
-## Why
+## How it works
 
-Gemini's free tier enforces per-key rate limits. If you have multiple API keys,
-this rotator lets you spread load across them and recover gracefully when one
-gets throttled — without any manual intervention.
+Keys cycle round-robin. When a key gets throttled:
+
+- **429 RESOURCE_EXHAUSTED** → key goes into a timed cooldown (60s, then 120s, 240s… capped at 30 min on repeat hits). Automatically returns to rotation when the window expires.
+- **403 CONSUMER_SUSPENDED / PERMISSION_DENIED** → key is blacklisted. Persisted to DB so it survives restarts. Probed again automatically on schedule.
+- **500 / 503** → transient; same key is retried.
+
+On top of that, each key tracks its own call timestamps in a 60-second rolling window. A key that has already hit its per-minute ceiling is **skipped proactively** — no waiting for a 429 to tell you it's exhausted.
 
 ---
 
 ## Installation
 
-Copy `gemini_rotator.py` into your project. That's it.
+Drop `gemini_rotator.py` into your project. No third-party dependencies.
 
 ```
 your-project/
-├── gemini_rotator.py   ← drop this in
-└── your_code.py
+└── gemini_rotator.py
 ```
 
-There are no third-party dependencies.
+Optional persistent stats and suspension tracking requires a DB adapter (see [examples/mongodb_adapter.py](examples/mongodb_adapter.py)).
 
 ---
 
 ## Quick start
 
 ```python
-import google.generativeai as genai
+import google.genai as genai
+from google.genai import types as genai_types
 from gemini_rotator import GeminiAPIRotator
 
-rotator = GeminiAPIRotator([
-    "AIza..key1..",
-    "AIza..key2..",
-    "AIza..key3..",
-])
+rotator = GeminiAPIRotator(
+    ["AIza..key1..", "AIza..key2..", "AIza..key3.."],
+    rpm_per_key=15,   # proactively skip a key after 15 calls/min
+)
 
 def call_gemini(prompt: str) -> str:
     key = rotator.get_next_working_key()
-    genai.configure(api_key=key)
+    if key is None:
+        raise RuntimeError("All keys suspended.")
+
+    client = genai.Client(api_key=key)
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model    = "gemini-2.5-flash",
+            contents = [prompt],
+            config   = genai_types.GenerateContentConfig(max_output_tokens=256),
+        )
+        rotator.record_success(key)
         return response.text
     except Exception as e:
-        if "429" in str(e) or "quota" in str(e).lower():
+        err = str(e)
+        if "CONSUMER_SUSPENDED" in err or "PERMISSION_DENIED" in err:
+            rotator.mark_suspended(key)
+        elif "429" in err or "RESOURCE_EXHAUSTED" in err:
             rotator.mark_rate_limited(key)
+        else:
+            rotator.record_error(key)
         raise
+```
+
+---
+
+## Loading keys from environment
+
+```python
+import os
+keys = [k.strip() for k in os.environ["GEMINI_API_KEYS"].split(",")]
+rotator = GeminiAPIRotator(keys)
 ```
 
 ---
 
 ## API
 
-### `GeminiAPIRotator(api_keys, cooldown_seconds=60)`
+### Constructor
+
+```python
+GeminiAPIRotator(keys, *, rpm_per_key=15, db=None)
+```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `api_keys` | `list[str]` | required | One or more Gemini API keys |
-| `cooldown_seconds` | `int` | `60` | How long a rate-limited key is skipped |
+| `keys` | `list[str]` | required | One or more Gemini API keys. Duplicates removed. |
+| `rpm_per_key` | `int` | `15` | Calls per key per 60s before it is proactively skipped. |
+| `db` | `DBAdapter \| None` | `None` | Optional adapter for persistent suspension and stats. |
 
 ---
 
-### Getting keys
+### Key selection
 
-#### `get_next_working_key() → str`
+#### `get_next_working_key() → str | None`
 
-Returns the next key not currently in cooldown, and advances the internal index.
-
-If **every** key is in cooldown, returns the one with the shortest remaining
-wait time rather than raising — you can decide whether to sleep or proceed.
-
-```python
-key = rotator.get_next_working_key()
-```
-
-#### `get_current_key() → str`
-
-Returns the current key without advancing the index.
+Returns the next available key. Skips suspended keys, cooling keys, and keys at their RPM ceiling. Falls back gracefully when everything is limited. Returns `None` only if every key is suspended.
 
 ---
 
-### Reporting failures
+### Reporting outcomes
+
+#### `record_success(key)`
+Call after every successful request. Resets the backoff counter and records the call for RPM tracking.
 
 #### `mark_rate_limited(key)`
+Call on **429 RESOURCE_EXHAUSTED**. Cooldown grows exponentially on repeat hits for the same key.
 
-Call this when a request returns a 429 / quota error. The key is put in cooldown
-for `cooldown_seconds` and the rotator moves to the next key.
+#### `mark_suspended(key)`
+Call on **403 CONSUMER_SUSPENDED / PERMISSION_DENIED**. Key is blacklisted and persisted to DB (if configured).
+
+#### `record_error(key)`
+Call on other errors (500, 503, network timeouts, etc.).
+
+---
+
+### Automatic recovery
+
+#### `async revalidate_suspended_keys()`
+
+Fires a cheap parallel probe against every suspended key. Keys that respond successfully are immediately unsuspended and rejoin rotation. Run this on a schedule:
 
 ```python
-except RateLimitError:
-    rotator.mark_rate_limited(key)
+async def recheck_loop(rotator):
+    while True:
+        await asyncio.sleep(6 * 60 * 60)   # every 6 hours
+        await rotator.revalidate_suspended_keys()
 ```
-
-`mark_failed` is kept as an alias.
 
 ---
 
 ### Observability
 
-#### `available_count() → int`
-
-Number of keys not currently in cooldown.
-
-#### `total_count() → int`
-
-Total number of managed keys.
-
 #### `status() → list[dict]`
 
-Returns a list of dicts, one per key:
+Structured per-key status:
 
 ```python
 [
     {
-        "masked": "AIza...zXyZ",
-        "available": True,
+        "masked": "...zXyZ1234",
+        "state": "active",          # "active" | "cooling" | "suspended"
         "cooldown_remaining": 0.0,
-        "requests": 42,
+        "rpm_used": 3,
+        "rpm_limit": 15,
+        "stats": {"success": 142, "rate_limit": 2, "error": 0},
     },
     ...
 ]
 ```
 
-#### `reset_cooldowns()`
+#### `masked_list() → list[str]`
 
-Clears all cooldowns immediately. Useful in tests or after a manual recovery.
+Human-readable lines for a `/stats` command or admin panel:
+
+```
+✅ ...abcd1234  active  ✓142  ⚠2  err:0  rpm:3/15
+⏳ ...efgh5678  cooling 47s  ✓98  ⚠5  err:0
+❌ ...ijkl9012  SUSPENDED  ✓201  ⚠12  err:3
+```
+
+#### `summary() → str`
+
+One-liner for health checks:
+
+```
+Keys: 4 total | 3 active | 1 cooling | 0 suspended
+```
+
+#### `get_active_count() → int`, `total_count() → int`
 
 ---
 
-### Hot-swap at runtime
+### Key management
 
 #### `add_key(key) → bool`
-
-Adds a key. Returns `False` if it already exists.
+Add a key at runtime. Returns `False` if it already exists.
 
 #### `remove_key(key) → bool`
-
-Removes a key. Returns `False` if not found. Raises `ValueError` if it's the
-last key.
-
-#### `sync_keys(new_keys)`
-
-Reconciles the managed key list against `new_keys` — adds new ones, removes
-missing ones, preserves cooldown state for keys that remain. Useful when keys
-are stored in a database.
-
-`reload_from_db` is kept as an alias.
+Remove a key at runtime. Returns `False` if not found. Raises `ValueError` if it is the last key.
 
 ---
 
-## Loading keys from environment variables
+## Persistent DB adapter
+
+By default all state is in-memory. Pass a `db` adapter to persist suspension state and stats across restarts.
+
+A ready-to-use MongoDB adapter is in [examples/mongodb_adapter.py](examples/mongodb_adapter.py). Implementing your own is straightforward — just satisfy this protocol:
 
 ```python
-import os
-from gemini_rotator import GeminiAPIRotator
-
-# Option 1: comma-separated list in one env var
-keys = os.environ["GEMINI_API_KEYS"].split(",")
-
-# Option 2: individual numbered vars
-keys = [v for k, v in os.environ.items() if k.startswith("GEMINI_KEY_")]
-
-rotator = GeminiAPIRotator(keys)
+class DBAdapter(Protocol):
+    def get_suspended_keys(self) -> set: ...
+    def mark_key_suspended(self, key: str) -> None: ...
+    def unmark_key_suspended(self, key: str) -> None: ...
+    def update_key_stat(self, key: str, event: str) -> None: ...
+    def get_all_key_stats(self) -> list: ...
 ```
+
+`event` is one of `"success"`, `"rate_limit"`, or `"error"`.
 
 ---
 
 ## Logging
 
-The rotator uses Python's standard `logging` module under the logger name
-`gemini_rotator`. To see its output:
+Uses Python's standard `logging` module under the logger name `gemini_rotator`.
 
 ```python
 import logging
@@ -190,7 +218,8 @@ logging.basicConfig(level=logging.INFO)
 ## Running the tests
 
 ```bash
-python -m pytest tests/
+pip install pytest
+pytest tests/
 ```
 
 ---
