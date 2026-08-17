@@ -1,255 +1,443 @@
 """
-gemini_rotator.py — Gemini API key rotation with cooldown-based rate-limit handling.
+gemini_rotator.py — Gemini API key rotation with persistent stats.
 
-Strategy:
-  - A key that hits rate limits is marked with a timestamp and skipped for
-    COOLDOWN_SECONDS. It is NOT permanently blacklisted.
-  - get_next_working_key() always returns a key not currently in cooldown.
-  - Per-key request counters are available for debugging/observability.
+Key states
+----------
+active     — available for use
+cooling    — rate-limited; skipped for a growing cooldown window
+             (in-memory, resets on restart)
+suspended  — permanently disabled; stored in the optional DB adapter
+             and survives restarts. Auto-retested on a schedule.
 
-Keys come from two sources (merged, deduplicated at runtime):
-  1. Constructor argument  →  GeminiAPIRotator(["key1", "key2"])
-  2. Hot-swap methods      →  add_key(), remove_key(), reload_from_db()
+Error handling
+--------------
+403 CONSUMER_SUSPENDED / PERMISSION_DENIED  → mark_suspended()
+429 RESOURCE_EXHAUSTED                      → mark_rate_limited()  (exponential backoff)
+500 / 503                                   → transient; retry same key
+
+Rate-limit avoidance
+--------------------
+- Round-robin selection spreads load evenly.
+- Per-key RPM tracking: a key that has already hit its call ceiling
+  within the rolling 60-second window is proactively skipped, so we
+  pre-empt 429s instead of reacting to them.
+- Repeated rate-limits grow the cooldown exponentially
+  (60s → 120s → 240s … capped at 30 min).
 """
 
+import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COOLDOWN_SECONDS = 60
+COOLDOWN_BASE_SECONDS = 60
+COOLDOWN_MAX_SECONDS  = 30 * 60
+RPM_WINDOW_SECONDS    = 60
+DEFAULT_RPM_PER_KEY   = 15
 
 
-class AllKeysExhausted(Exception):
-    """Raised when every key is in cooldown and no fallback is possible."""
+# ── Optional DB adapter ───────────────────────────────────────────────────────
+#
+# Supply any object that satisfies DBAdapter when constructing GeminiAPIRotator.
+# If you pass nothing, all state is in-memory only (suspended keys reset on
+# restart, no persistent stats).
 
+@runtime_checkable
+class DBAdapter(Protocol):
+    def get_suspended_keys(self) -> set: ...
+    def mark_key_suspended(self, key: str) -> None: ...
+    def unmark_key_suspended(self, key: str) -> None: ...
+    def update_key_stat(self, key: str, event: str) -> None: ...
+    def get_all_key_stats(self) -> list: ...
+
+
+class _NoopDB:
+    """Fallback used when no real DB adapter is provided."""
+    def get_suspended_keys(self)               -> set:  return set()
+    def mark_key_suspended(self, key: str)     -> None: pass
+    def unmark_key_suspended(self, key: str)   -> None: pass
+    def update_key_stat(self, key, event)      -> None: pass
+    def get_all_key_stats(self)                -> list: return []
+
+
+# ── Rotator ───────────────────────────────────────────────────────────────────
 
 class GeminiAPIRotator:
     """
-    Round-robin Gemini API key rotator with per-key cooldown on rate limits.
+    Round-robin Gemini API key rotator with per-key cooldown, exponential
+    backoff, RPM-ceiling pre-emption, and optional persistent suspension.
 
     Parameters
     ----------
-    api_keys : list[str]
+    keys : list[str]
         One or more Gemini API keys.
-    cooldown_seconds : int
-        How long (in seconds) a failed key sits out before being retried.
-        Default: 60.
+    rpm_per_key : int
+        Maximum calls per key per 60-second rolling window before it is
+        proactively skipped. Default: 15.
+    db : DBAdapter | None
+        Optional database adapter for persistent suspension state and stats.
+        Pass None (default) to use in-memory state only.
     """
 
     def __init__(
         self,
-        api_keys: List[str],
-        cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+        keys: List[str],
+        *,
+        rpm_per_key: int = DEFAULT_RPM_PER_KEY,
+        db: Optional[DBAdapter] = None,
     ) -> None:
-        if not api_keys:
-            raise ValueError("At least one Gemini API key is required.")
+        if not keys:
+            raise ValueError("At least one API key is required.")
 
-        self.cooldown_seconds: int = cooldown_seconds
-        self.keys: List[str] = list(dict.fromkeys(api_keys))  # deduplicate, preserve order
-        self._index: int = 0
-        # unix timestamp until which a key is in cooldown; 0.0 = available
-        self._cooldown_until: Dict[str, float] = {k: 0.0 for k in self.keys}
-        self._request_count: Dict[str, int] = {k: 0 for k in self.keys}
+        self._keys: List[str]       = list(dict.fromkeys(keys))  # deduplicate
+        self._rpm_per_key: int      = rpm_per_key
+        self._db: DBAdapter         = db if isinstance(db, DBAdapter) else _NoopDB()
+        self._last_index: int       = -1
 
+        # in-memory state
+        self._cooling: dict         = {}  # key → expiry timestamp
+        self._suspended: set        = set()
+        self._consecutive_limits    = {}  # key → int
+        self._call_times: dict      = {}  # key → [timestamp, ...]
+
+        # Load persisted suspensions
+        try:
+            self._suspended = self._db.get_suspended_keys()
+            if self._suspended:
+                logger.info("[APIRotator] %d suspended key(s) loaded from DB.", len(self._suspended))
+        except Exception as exc:
+            logger.warning("[APIRotator] Could not load suspended keys: %s", exc)
+
+        active = len([k for k in self._keys if k not in self._suspended])
         logger.info(
-            "GeminiAPIRotator ready — %d key(s), %ds cooldown on rate-limit.",
-            len(self.keys),
-            self.cooldown_seconds,
+            "[APIRotator] %d key(s) loaded (%d active, %d suspended), "
+            "%ds base cooldown, %d RPM/key ceiling.",
+            len(self._keys), active, len(self._suspended),
+            COOLDOWN_BASE_SECONDS, self._rpm_per_key,
         )
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Core rotation
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Key selection ─────────────────────────────────────────────────────────
 
-    def get_current_key(self) -> str:
-        """Return the key at the current index without advancing."""
-        return self.keys[self._index]
-
-    def get_next_working_key(self) -> str:
+    def get_next_working_key(self) -> Optional[str]:
         """
-        Return the next available (not in cooldown) key and advance the index.
+        Return the next ready key using round-robin selection.
 
-        If every key is currently in cooldown, returns the one with the
-        shortest remaining wait time instead of raising — callers can choose
-        to wait or proceed at their own risk.
+        Skips suspended keys, keys still in cooldown, and keys that have
+        already hit their RPM ceiling within the rolling window.
 
-        Returns
-        -------
-        str
-            An API key to use for the next request.
+        If no key is fully free, falls back to a key that is merely at its
+        RPM ceiling (still better than a cooling key). If every key is
+        cooling or suspended, returns the one whose cooldown expires soonest
+        so the caller can wait it out. Returns None only when every key is
+        suspended.
         """
-        for _ in range(len(self.keys)):
-            key = self.keys[self._index]
-            if self._is_available(key):
-                self._request_count[key] += 1
-                self._rotate()
-                return key
-            self._rotate()
+        now = time.time()
+        n   = len(self._keys)
+        if n == 0:
+            return None
 
-        # All keys in cooldown — hand back the soonest-recovering one
-        soonest = min(self.keys, key=lambda k: self._cooldown_until.get(k, 0.0))
-        wait = max(0.0, self._cooldown_until[soonest] - time.time())
-        logger.warning(
-            "All %d key(s) in cooldown. Soonest recovers in %.0fs.",
-            len(self.keys),
-            wait,
-        )
-        self._request_count[soonest] += 1
-        return soonest
+        at_rpm_limit: List[str] = []
+
+        for offset in range(1, n + 1):
+            idx = (self._last_index + offset) % n
+            key = self._keys[idx]
+
+            if key in self._suspended:
+                continue
+            if now < self._cooling.get(key, 0):
+                continue
+            if self._calls_in_window(key, now) >= self._rpm_per_key:
+                at_rpm_limit.append(key)
+                continue
+
+            self._last_index = idx
+            return key
+
+        # Fall back to a key that is only RPM-limited
+        if at_rpm_limit:
+            key = at_rpm_limit[0]
+            self._last_index = self._keys.index(key)
+            return key
+
+        # Everything is cooling or suspended — return soonest-recovering key
+        available = [k for k in self._keys if k not in self._suspended]
+        if not available:
+            return None
+        return min(available, key=lambda k: self._cooling.get(k, 0))
+
+    # ── Per-key RPM tracking ──────────────────────────────────────────────────
+
+    def _calls_in_window(self, key: str, now: float) -> int:
+        cutoff = now - RPM_WINDOW_SECONDS
+        times  = [t for t in self._call_times.get(key, []) if t >= cutoff]
+        self._call_times[key] = times
+        return len(times)
+
+    def _record_call(self, key: str) -> None:
+        now    = time.time()
+        cutoff = now - RPM_WINDOW_SECONDS
+        bucket = self._call_times.setdefault(key, [])
+        bucket.append(now)
+        self._call_times[key] = [t for t in bucket if t >= cutoff]
+
+    # ── State updates ─────────────────────────────────────────────────────────
 
     def mark_rate_limited(self, key: str) -> None:
         """
-        Call this when a request with `key` returns a rate-limit / quota error.
-        The key will be skipped for `cooldown_seconds` seconds.
+        Call when a request returns 429 RESOURCE_EXHAUSTED.
+
+        Cooldown grows exponentially with consecutive hits:
+        60s → 120s → 240s → … capped at 30 minutes.
         """
-        if key not in self._cooldown_until:
-            return
-        self._cooldown_until[key] = time.time() + self.cooldown_seconds
+        hits    = self._consecutive_limits.get(key, 0) + 1
+        self._consecutive_limits[key] = hits
+        cooldown = min(COOLDOWN_BASE_SECONDS * (2 ** (hits - 1)), COOLDOWN_MAX_SECONDS)
+        self._cooling[key] = time.time() + cooldown
+        self._db.update_key_stat(key, "rate_limit")
         logger.warning(
-            "Key %s rate-limited — cooling down for %ds.",
-            _mask(key),
-            self.cooldown_seconds,
+            "[APIRotator] Key ...%s rate-limited (hit #%d) — cooling %ds.",
+            key[-6:], hits, cooldown,
         )
-        self._rotate()
 
-    # Alias kept for compatibility with older internal usage
-    mark_failed = mark_rate_limited
+    def mark_suspended(self, key: str) -> None:
+        """
+        Call when a request returns 403 CONSUMER_SUSPENDED / PERMISSION_DENIED.
 
-    def reset_cooldowns(self) -> None:
-        """Clear all cooldowns immediately (useful in tests or manual recovery)."""
-        for k in self.keys:
-            self._cooldown_until[k] = 0.0
-        logger.info("All cooldowns cleared.")
+        The key is blacklisted in memory and persisted to the DB.
+        revalidate_suspended_keys() will probe it again on schedule.
+        """
+        self._suspended.add(key)
+        self._consecutive_limits.pop(key, None)
+        self._db.mark_key_suspended(key)
+        remaining = len([k for k in self._keys if k not in self._suspended])
+        logger.error(
+            "[APIRotator] Key ...%s SUSPENDED. %d key(s) remaining. "
+            "Will be auto-rechecked periodically.",
+            key[-6:], remaining,
+        )
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Observability
-    # ──────────────────────────────────────────────────────────────────────
+    def record_success(self, key: str) -> None:
+        """
+        Call after every successful request.
 
-    def available_count(self) -> int:
-        """Number of keys not currently in cooldown."""
-        return sum(1 for k in self.keys if self._is_available(k))
+        Resets the consecutive-rate-limit counter, records the call for RPM
+        tracking, and increments persistent success stats.
+        """
+        self._consecutive_limits[key] = 0
+        self._record_call(key)
+        self._db.update_key_stat(key, "success")
 
-    def total_count(self) -> int:
-        """Total number of managed keys."""
-        return len(self.keys)
+    def record_error(self, key: str) -> None:
+        """
+        Call on non-rate-limit, non-suspension errors (e.g. 500, 503).
+
+        Records the call for RPM tracking and increments persistent error stats.
+        """
+        self._record_call(key)
+        self._db.update_key_stat(key, "error")
+
+    # ── Suspended-key auto-recheck ────────────────────────────────────────────
+
+    async def revalidate_suspended_keys(self) -> None:
+        """
+        Fire a cheap, parallel probe against every currently-suspended key.
+
+        Any key that responds successfully is unsuspended and rejoins rotation
+        immediately. Designed to be called on a schedule (e.g. every 6 hours)
+        — no user-facing command needed.
+        """
+        snapshot = list(self._suspended)
+        if not snapshot:
+            return
+
+        logger.info("[APIRotator] Auto-recheck: testing %d suspended key(s)…", len(snapshot))
+
+        loop    = asyncio.get_running_loop()
+        results = await asyncio.gather(
+            *(loop.run_in_executor(None, self._probe_key, k) for k in snapshot),
+            return_exceptions=True,
+        )
+
+        recovered = 0
+        for key, ok in zip(snapshot, results):
+            if ok is True:
+                self._suspended.discard(key)
+                self._cooling.pop(key, None)
+                self._consecutive_limits[key] = 0
+                self._db.unmark_key_suspended(key)
+                recovered += 1
+                logger.info("[APIRotator] Key ...%s RECOVERED — rejoining rotation.", key[-6:])
+
+        logger.info(
+            "[APIRotator] Auto-recheck complete: %d/%d key(s) recovered.",
+            recovered, len(snapshot),
+        )
+
+    @staticmethod
+    def _probe_key(key: str) -> bool:
+        """
+        Minimal Gemini call used only to check whether a suspended key works again.
+        Returns True if the key is usable, False otherwise.
+        """
+        try:
+            import google.genai as genai
+            from google.genai import types as genai_types
+
+            client   = genai.Client(api_key=key)
+            config   = genai_types.GenerateContentConfig(max_output_tokens=8)
+            response = client.models.generate_content(
+                model    = "gemini-2.5-flash",
+                contents = ["ping"],
+                config   = config,
+            )
+            return response is not None
+        except Exception as exc:
+            msg = str(exc)
+            if any(m in msg for m in (
+                "CONSUMER_SUSPENDED", "PERMISSION_DENIED",
+                "API_KEY_INVALID", "suspended", "disabled",
+            )):
+                return False
+            logger.debug("[APIRotator] Recheck for ...%s inconclusive: %s", key[-6:], exc)
+            return False
+
+    # ── Observability ─────────────────────────────────────────────────────────
 
     def status(self) -> List[dict]:
         """
         Return a list of dicts describing each key's current state.
 
         Each dict contains:
-            masked   — first 4 + last 4 chars, rest replaced by "..."
-            available — bool
-            cooldown_remaining — seconds left (0 if available)
-            requests — total requests served by this key
+            masked            — last 8 chars, prefixed with "..."
+            state             — "active" | "cooling" | "suspended"
+            cooldown_remaining — seconds left in cooldown (0 if not cooling)
+            rpm_used          — calls made in the current 60s window
+            rpm_limit         — per-key RPM ceiling
+            stats             — dict with success/rate_limit/error counts from DB
         """
-        now = time.time()
-        return [
-            {
-                "masked": _mask(k),
-                "available": self._is_available(k),
-                "cooldown_remaining": max(0.0, self._cooldown_until.get(k, 0.0) - now),
-                "requests": self._request_count.get(k, 0),
-            }
-            for k in self.keys
-        ]
+        now       = time.time()
+        stats_map = {}
+        try:
+            stats_map = {d["key"]: d for d in self._db.get_all_key_stats()}
+        except Exception:
+            pass
 
-    def __repr__(self) -> str:
+        out = []
+        for key in self._keys:
+            if key in self._suspended:
+                state = "suspended"
+            elif now < self._cooling.get(key, 0):
+                state = "cooling"
+            else:
+                state = "active"
+
+            s = stats_map.get(key, {})
+            out.append({
+                "masked":             f"...{key[-8:]}",
+                "state":              state,
+                "cooldown_remaining": max(0.0, self._cooling.get(key, 0) - now),
+                "rpm_used":           self._calls_in_window(key, now),
+                "rpm_limit":          self._rpm_per_key,
+                "stats": {
+                    "success":    s.get("total_success", 0),
+                    "rate_limit": s.get("total_rate_limit", 0),
+                    "error":      s.get("total_error", 0),
+                },
+            })
+        return out
+
+    def summary(self) -> str:
+        """One-line summary — useful for health checks and log lines."""
+        now       = time.time()
+        suspended = len(self._suspended)
+        cooling   = sum(
+            1 for k in self._keys
+            if k not in self._suspended and now < self._cooling.get(k, 0)
+        )
+        active = len(self._keys) - suspended - cooling
         return (
-            f"<GeminiAPIRotator keys={len(self.keys)} "
-            f"available={self.available_count()} "
-            f"cooldown={self.cooldown_seconds}s>"
+            f"Keys: {len(self._keys)} total | "
+            f"{active} active | {cooling} cooling | {suspended} suspended"
         )
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Hot-swap
-    # ──────────────────────────────────────────────────────────────────────
+    def masked_list(self) -> List[str]:
+        """
+        Human-readable per-key status lines suitable for a /stats command or
+        admin panel.
+        """
+        now    = time.time()
+        lines  = []
+        stats_map = {}
+        try:
+            stats_map = {d["key"]: d for d in self._db.get_all_key_stats()}
+        except Exception:
+            pass
+
+        for key in self._keys:
+            s      = stats_map.get(key, {})
+            ok     = s.get("total_success", 0)
+            rl     = s.get("total_rate_limit", 0)
+            errs   = s.get("total_error", 0)
+            masked = f"...{key[-8:]}"
+
+            if key in self._suspended:
+                lines.append(f"❌ {masked}  SUSPENDED  ✓{ok}  ⚠{rl}  err:{errs}")
+            elif now < self._cooling.get(key, 0):
+                secs = int(self._cooling[key] - now)
+                lines.append(f"⏳ {masked}  cooling {secs}s  ✓{ok}  ⚠{rl}  err:{errs}")
+            else:
+                rpm = self._calls_in_window(key, now)
+                lines.append(
+                    f"✅ {masked}  active  ✓{ok}  ⚠{rl}  err:{errs}  "
+                    f"rpm:{rpm}/{self._rpm_per_key}"
+                )
+        return lines
+
+    # ── Key management ────────────────────────────────────────────────────────
 
     def add_key(self, key: str) -> bool:
-        """
-        Add a new key at runtime.
-
-        Returns True if added, False if the key already exists.
-        """
-        if key in self.keys:
+        """Add a key at runtime. Returns False if it already exists."""
+        if key in self._keys:
             return False
-        self.keys.append(key)
-        self._cooldown_until[key] = 0.0
-        self._request_count[key] = 0
-        logger.info("Key added. Total: %d.", len(self.keys))
+        self._keys.append(key)
+        logger.info("[APIRotator] Key added. Total: %d.", len(self._keys))
         return True
 
     def remove_key(self, key: str) -> bool:
         """
-        Remove a key at runtime.
-
-        Returns True if removed, False if not found.
-        Raises ValueError if this is the last key.
+        Remove a key at runtime. Returns False if not found.
+        Raises ValueError if it is the last key.
         """
-        if key not in self.keys:
+        if key not in self._keys:
             return False
-        if len(self.keys) == 1:
+        if len(self._keys) == 1:
             raise ValueError("Cannot remove the last API key.")
-
-        idx = self.keys.index(key)
-        self.keys.remove(key)
-        self._cooldown_until.pop(key, None)
-        self._request_count.pop(key, None)
-
-        # Keep _index valid
-        if self._index >= len(self.keys):
-            self._index = 0
-        elif self._index > idx:
-            self._index -= 1
-
-        logger.info("Key removed. Total: %d.", len(self.keys))
+        self._keys.remove(key)
+        self._suspended.discard(key)
+        self._cooling.pop(key, None)
+        self._consecutive_limits.pop(key, None)
+        self._call_times.pop(key, None)
+        if self._last_index >= len(self._keys):
+            self._last_index = -1
+        logger.info("[APIRotator] Key removed. Total: %d.", len(self._keys))
         return True
 
-    def sync_keys(self, new_keys: List[str]) -> None:
-        """
-        Sync the key list to `new_keys` (e.g. after re-reading from a database).
+    def get_active_count(self) -> int:
+        """Number of keys that are neither suspended nor cooling."""
+        now = time.time()
+        return sum(
+            1 for k in self._keys
+            if k not in self._suspended and now >= self._cooling.get(k, 0)
+        )
 
-        Keys in `new_keys` but not currently managed are added.
-        Keys currently managed but absent from `new_keys` are removed.
-        Existing keys retain their cooldown and request-count state.
-        """
-        new_set = set(new_keys)
-        current_set = set(self.keys)
+    def total_count(self) -> int:
+        return len(self._keys)
 
-        for k in new_set - current_set:
-            self.keys.append(k)
-            self._cooldown_until[k] = 0.0
-            self._request_count[k] = 0
-
-        removed = current_set - new_set
-        self.keys = [k for k in self.keys if k not in removed]
-        for k in removed:
-            self._cooldown_until.pop(k, None)
-            self._request_count.pop(k, None)
-
-        if not self.keys:
-            raise ValueError("No API keys remaining after sync.")
-
-        self._index = min(self._index, len(self.keys) - 1)
-        logger.info("Keys synced. Total: %d.", len(self.keys))
-
-    # Alias for users coming from the old internal API
-    reload_from_db = sync_keys
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Internals
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _rotate(self) -> None:
-        self._index = (self._index + 1) % len(self.keys)
-
-    def _is_available(self, key: str) -> bool:
-        return time.time() >= self._cooldown_until.get(key, 0.0)
-
-
-def _mask(key: str) -> str:
-    if len(key) <= 8:
-        return "****"
-    return f"{key[:4]}...{key[-4:]}"
+    def __repr__(self) -> str:
+        return (
+            f"<GeminiAPIRotator total={len(self._keys)} "
+            f"active={self.get_active_count()} "
+            f"rpm_limit={self._rpm_per_key}>"
+        )
