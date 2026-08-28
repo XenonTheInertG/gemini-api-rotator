@@ -1,0 +1,53 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name        = "gemini-rotator"
+version     = "2.0.0"
+description = "Production-grade Gemini API key rotation with cooldown, exponential backoff, RPM tracking, and persistent stats."
+readme      = "README.md"
+license     = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords    = ["gemini", "google-ai", "api-key", "rate-limit", "rotation", "llm"]
+
+authors = [
+    { name = "Gopal" },
+]
+
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+# Zero required dependencies — google-genai is optional (only needed for execute())
+dependencies = []
+
+[project.optional-dependencies]
+genai   = ["google-genai>=1.0"]
+mongo   = ["pymongo>=4.0"]
+all     = ["google-genai>=1.0", "pymongo>=4.0"]
+dev     = ["pytest>=8.0", "pytest-asyncio>=0.23", "google-genai>=1.0"]
+
+[project.scripts]
+gemini-rotator = "gemini_rotator.cli:main"
+
+[project.urls]
+Homepage   = "https://github.com/gopal/gemini-rotator"
+Repository = "https://github.com/gopal/gemini-rotator"
+Issues     = "https://github.com/gopal/gemini-rotator/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gemini_rotator*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths    = ["tests"]

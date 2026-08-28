@@ -1,216 +1,306 @@
-# gemini-key-rotator
+# gemini-rotator
 
-Gemini API key rotation with proactive rate-limit avoidance, exponential backoff, and optional persistent suspension tracking.
+Production-grade Gemini API key rotation with automatic rate-limit handling, exponential backoff, per-key RPM tracking, per-request latency stats, and optional persistence.
+
+```bash
+pip install gemini-rotator
+```
 
 ---
 
-## How it works
+## Why
 
-Keys cycle round-robin. When a key gets throttled:
+Gemini's free tier enforces per-key rate limits and quota ceilings. With multiple keys you can spread load across them — but only if you handle the rotation, cooldowns, retries, and stats correctly. This library does all of that.
 
-- **429 RESOURCE_EXHAUSTED** → key goes into a timed cooldown (60s, then 120s, 240s… capped at 30 min on repeat hits). Automatically returns to rotation when the window expires.
-- **403 CONSUMER_SUSPENDED / PERMISSION_DENIED** → key is blacklisted. Persisted to DB so it survives restarts. Probed again automatically on schedule.
-- **500 / 503** → transient; same key is retried.
-
-On top of that, each key tracks its own call timestamps in a 60-second rolling window. A key that has already hit its per-minute ceiling is **skipped proactively** — no waiting for a 429 to tell you it's exhausted.
+Key design goals:
+- **Zero friction** — `await rotator.execute(prompt)` handles everything
+- **Zero required dependencies** — core library is pure stdlib; `google-genai` only needed for actual API calls
+- **Persistent stats** — per-request latency stored in SQLite (ships with Python)
+- **Thread-safe** — works in async apps, threaded workers, Telegram bots, FastAPI, anything
 
 ---
 
-## Installation
+## Install
 
-Drop `gemini_rotator.py` into your project. No third-party dependencies.
+```bash
+# Core library only (no dependencies)
+pip install gemini-rotator
 
+# With google-genai so you can use execute()
+pip install "gemini-rotator[genai]"
+
+# With MongoDB adapter
+pip install "gemini-rotator[mongo]"
+
+# Everything
+pip install "gemini-rotator[all]"
 ```
-your-project/
-└── gemini_rotator.py
-```
-
-Optional persistent stats and suspension tracking requires a DB adapter (see [examples/mongodb_adapter.py](examples/mongodb_adapter.py)).
 
 ---
 
 ## Quick start
 
 ```python
-import google.genai as genai
-from google.genai import types as genai_types
+import asyncio
 from gemini_rotator import GeminiAPIRotator
 
-rotator = GeminiAPIRotator(
-    ["AIza..key1..", "AIza..key2..", "AIza..key3.."],
-    rpm_per_key=15,   # proactively skip a key after 15 calls/min
+rotator = GeminiAPIRotator([
+    "AIza..key1..",
+    "AIza..key2..",
+    "AIza..key3..",
+])
+
+async def main():
+    response = await rotator.execute("Explain async/await in one sentence.")
+    print(response.text)
+
+asyncio.run(main())
+```
+
+That's it. Key selection, retries, cooldowns, and stat recording happen automatically.
+
+---
+
+## With SQLite persistence
+
+Suspension state and latency stats survive restarts.
+
+```python
+from gemini_rotator import GeminiAPIRotator
+from gemini_rotator.adapters import SQLiteAdapter
+
+db      = SQLiteAdapter("gemini_keys.db")
+rotator = GeminiAPIRotator(keys, db=db)
+```
+
+---
+
+## With custom config
+
+```python
+from gemini_rotator import GeminiAPIRotator, RotatorConfig
+
+cfg = RotatorConfig(
+    rpm_per_key            = 10,      # proactively skip a key after 10 calls/min
+    cooldown_base_seconds  = 60,      # first rate-limit = 60s cooldown
+    cooldown_max_seconds   = 1800,    # cap at 30 min after repeated hits
+    max_concurrent_per_key = 3,       # max simultaneous requests per key
+    max_retries            = 4,       # retries before raising
+    retry_delay_seconds    = 1.0,
 )
 
-def call_gemini(prompt: str) -> str:
-    key = rotator.get_next_working_key()
-    if key is None:
-        raise RuntimeError("All keys suspended.")
-
-    client = genai.Client(api_key=key)
-    try:
-        response = client.models.generate_content(
-            model    = "gemini-2.5-flash",
-            contents = [prompt],
-            config   = genai_types.GenerateContentConfig(max_output_tokens=256),
-        )
-        rotator.record_success(key)
-        return response.text
-    except Exception as e:
-        err = str(e)
-        if "CONSUMER_SUSPENDED" in err or "PERMISSION_DENIED" in err:
-            rotator.mark_suspended(key)
-        elif "429" in err or "RESOURCE_EXHAUSTED" in err:
-            rotator.mark_rate_limited(key)
-        else:
-            rotator.record_error(key)
-        raise
+rotator = GeminiAPIRotator(keys, config=cfg)
 ```
 
 ---
 
-## Loading keys from environment
+## Batch requests
 
 ```python
-import os
-keys = [k.strip() for k in os.environ["GEMINI_API_KEYS"].split(",")]
-rotator = GeminiAPIRotator(keys)
+prompts = ["Summarise X", "Translate Y", "Classify Z", ...]
+
+responses = await rotator.execute_batch(
+    prompts,
+    model       = "gemini-2.5-flash",
+    concurrency = 10,   # max simultaneous requests
+)
+
+for r in responses:
+    if isinstance(r, Exception):
+        print("failed:", r)
+    else:
+        print(r.text)
 ```
 
 ---
 
-## API
+## Manual key management
 
-### Constructor
+If you prefer to manage keys yourself:
 
 ```python
-GeminiAPIRotator(keys, *, rpm_per_key=15, db=None)
+key = rotator.get_next_working_key()
+if key is None:
+    raise RuntimeError("All keys suspended.")
+
+rotator.acquire(key)   # track concurrency
+try:
+    response = client.models.generate_content(...)
+    rotator.record_success(key, latency=elapsed, model="gemini-2.5-flash")
+except Exception as e:
+    rotator.record_outcome(key, exc=e)   # auto-classifies and routes
+finally:
+    rotator.release(key)
 ```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `keys` | `list[str]` | required | One or more Gemini API keys. Duplicates removed. |
-| `rpm_per_key` | `int` | `15` | Calls per key per 60s before it is proactively skipped. |
-| `db` | `DBAdapter \| None` | `None` | Optional adapter for persistent suspension and stats. |
+---
+
+## Error classification
+
+`record_outcome(key, exc=e)` classifies the exception automatically:
+
+| Exception message contains | Action |
+|---|---|
+| `429`, `RESOURCE_EXHAUSTED`, `QUOTA` | `mark_rate_limited()` — exponential cooldown |
+| `CONSUMER_SUSPENDED`, `PERMISSION_DENIED`, `API_KEY_INVALID` | `mark_suspended()` — blacklisted until recheck |
+| `500`, `503`, `INTERNAL`, `UNAVAILABLE` | `record_error()` — transient, retry same key |
+| anything else | `record_error()` — unknown |
 
 ---
 
-### Key selection
-
-#### `get_next_working_key() → str | None`
-
-Returns the next available key. Skips suspended keys, cooling keys, and keys at their RPM ceiling. Falls back gracefully when everything is limited. Returns `None` only if every key is suspended.
-
----
-
-### Reporting outcomes
-
-#### `record_success(key)`
-Call after every successful request. Resets the backoff counter and records the call for RPM tracking.
-
-#### `mark_rate_limited(key)`
-Call on **429 RESOURCE_EXHAUSTED**. Cooldown grows exponentially on repeat hits for the same key.
-
-#### `mark_suspended(key)`
-Call on **403 CONSUMER_SUSPENDED / PERMISSION_DENIED**. Key is blacklisted and persisted to DB (if configured).
-
-#### `record_error(key)`
-Call on other errors (500, 503, network timeouts, etc.).
-
----
-
-### Automatic recovery
-
-#### `async revalidate_suspended_keys()`
-
-Fires a cheap parallel probe against every suspended key. Keys that respond successfully are immediately unsuspended and rejoin rotation. Run this on a schedule:
+## Alert hooks
 
 ```python
-async def recheck_loop(rotator):
+import requests
+
+def alert_slack(key: str):
+    requests.post(SLACK_WEBHOOK, json={"text": f"Gemini key {key[-6:]} suspended!"})
+
+rotator = GeminiAPIRotator(
+    keys,
+    on_key_suspended = alert_slack,
+    on_key_recovered = lambda k: print(f"Key {k[-6:]} recovered."),
+)
+```
+
+---
+
+## Automatic suspended-key recovery
+
+Suspended keys are automatically probed on a schedule. Any key that starts responding again rejoins rotation immediately.
+
+```python
+async def recheck_loop():
     while True:
         await asyncio.sleep(6 * 60 * 60)   # every 6 hours
         await rotator.revalidate_suspended_keys()
+
+asyncio.create_task(recheck_loop())
 ```
 
 ---
 
-### Observability
+## Observability
 
-#### `status() → list[dict]`
+### Summary line
+```python
+print(rotator.summary())
+# Keys: 4 total | 2 active | 1 cooling | 1 suspended
+```
 
-Structured per-key status:
+### Per-key status
+```python
+for s in rotator.status():
+    print(s.masked, s.state, s.cooldown_remaining, s.stats.avg_latency)
+```
+
+Each `KeyStatus` object:
+
+| Field | Type | Description |
+|---|---|---|
+| `masked` | str | `AIza...abcd1234` |
+| `state` | KeyState | `active` / `cooling` / `suspended` |
+| `cooldown_remaining` | float | Seconds left in cooldown |
+| `consecutive_limits` | int | Consecutive rate-limit hits |
+| `rpm_used` | int | Calls in the last 60s |
+| `stats.total_requests` | int | Lifetime requests |
+| `stats.success_rate` | float | 0.0 – 1.0 |
+| `stats.avg_latency` | float | Seconds (None if no data) |
+| `stats.latency_min/max` | float | Seconds |
+
+### Export as JSON
+```python
+import json
+print(json.dumps(rotator.export_stats(), indent=2))
+```
+
+### Latency history (SQLite only)
+```python
+rows = db.get_latency_history(key="AIza...", limit=100)
+# [{"key": ..., "latency_ms": 312.4, "model": "gemini-2.5-flash", "ts": ...}, ...]
+```
+
+---
+
+## CLI
+
+```bash
+export GEMINI_API_KEYS="key1,key2,key3"
+export GEMINI_ROTATOR_DB="gemini_keys.db"   # optional, default: ./gemini_rotator.db
+
+gemini-rotator status           # per-key status table
+gemini-rotator stats            # cumulative stats
+gemini-rotator stats --json     # machine-readable
+gemini-rotator latency          # recent per-request latency log
+gemini-rotator latency --limit 100
+gemini-rotator test             # probe every key against Gemini live
+gemini-rotator add AIzaSy...    # add a key
+gemini-rotator remove AIzaSy... # remove a key
+gemini-rotator reset-cooldowns  # clear all cooldowns
+gemini-rotator reset-stats      # reset all stats
+gemini-rotator reset-stats AIzaSy...  # reset one key's stats
+```
+
+Example `gemini-rotator status` output:
+```
+  Keys: 4 total | 2 active | 1 cooling | 1 suspended
+
+  KEY               STATE       COOLDOWN      RPM    REQUESTS    OK%   AVG ms
+  ────────────────  ──────────  ─────────  ──────   ─────────  ─────  ───────
+  AIza...abcd1234   ● active            —    3/15        1423   98%      312
+  AIza...efgh5678   ● active            —    1/15         891   97%      289
+  AIza...ijkl9012   ⏳ cooling        47s    0/15         234   85%      401
+  AIza...mnop3456   ❌ suspended         —    0/15          89   71%      —
+```
+
+---
+
+## Custom DB adapter
+
+Implement the `DBAdapter` protocol to use any backend (PostgreSQL, Redis, DynamoDB, …):
 
 ```python
-[
-    {
-        "masked": "...zXyZ1234",
-        "state": "active",          # "active" | "cooling" | "suspended"
-        "cooldown_remaining": 0.0,
-        "rpm_used": 3,
-        "rpm_limit": 15,
-        "stats": {"success": 142, "rate_limit": 2, "error": 0},
-    },
-    ...
-]
-```
+from gemini_rotator.adapters import DBAdapter
+from gemini_rotator.models   import KeyStats
+from typing import Optional, Set
 
-#### `masked_list() → list[str]`
-
-Human-readable lines for a `/stats` command or admin panel:
-
-```
-✅ ...abcd1234  active  ✓142  ⚠2  err:0  rpm:3/15
-⏳ ...efgh5678  cooling 47s  ✓98  ⚠5  err:0
-❌ ...ijkl9012  SUSPENDED  ✓201  ⚠12  err:3
-```
-
-#### `summary() → str`
-
-One-liner for health checks:
-
-```
-Keys: 4 total | 3 active | 1 cooling | 0 suspended
-```
-
-#### `get_active_count() → int`, `total_count() → int`
-
----
-
-### Key management
-
-#### `add_key(key) → bool`
-Add a key at runtime. Returns `False` if it already exists.
-
-#### `remove_key(key) → bool`
-Remove a key at runtime. Returns `False` if not found. Raises `ValueError` if it is the last key.
-
----
-
-## Persistent DB adapter
-
-By default all state is in-memory. Pass a `db` adapter to persist suspension state and stats across restarts.
-
-A ready-to-use MongoDB adapter is in [examples/mongodb_adapter.py](examples/mongodb_adapter.py). Implementing your own is straightforward — just satisfy this protocol:
-
-```python
-class DBAdapter(Protocol):
-    def get_suspended_keys(self) -> set: ...
+class MyAdapter:
+    def get_suspended_keys(self) -> Set[str]: ...
     def mark_key_suspended(self, key: str) -> None: ...
     def unmark_key_suspended(self, key: str) -> None: ...
-    def update_key_stat(self, key: str, event: str) -> None: ...
-    def get_all_key_stats(self) -> list: ...
+    def record_request(self, key, event, latency=None, model=None) -> None: ...
+    def get_stats(self, key: str) -> KeyStats: ...
+    def get_all_stats(self) -> list[KeyStats]: ...
+    def reset_stats(self, key: Optional[str] = None) -> None: ...
+
+rotator = GeminiAPIRotator(keys, db=MyAdapter())
 ```
 
-`event` is one of `"success"`, `"rate_limit"`, or `"error"`.
+`event` is one of `"success"`, `"rate_limit"`, `"suspended"`, `"transient"`, `"error"`.
 
 ---
 
-## Logging
-
-Uses Python's standard `logging` module under the logger name `gemini_rotator`.
+## Integrating with a Telegram bot
 
 ```python
-import logging
-logging.basicConfig(level=logging.INFO)
+from telegram.ext import ApplicationBuilder
+from gemini_rotator import GeminiAPIRotator
+from gemini_rotator.adapters import SQLiteAdapter
+
+db      = SQLiteAdapter("bot_keys.db")
+rotator = GeminiAPIRotator(
+    keys,
+    db               = db,
+    on_key_suspended = lambda k: logger.error("Key suspended: %s", k[-6:]),
+)
+
+async def handle_message(update, context):
+    response = await rotator.execute(
+        update.message.text,
+        model      = "gemini-2.5-flash",
+        max_tokens = 512,
+    )
+    await update.message.reply_text(response.text)
 ```
 
 ---
@@ -218,8 +308,8 @@ logging.basicConfig(level=logging.INFO)
 ## Running the tests
 
 ```bash
-pip install pytest
-pytest tests/
+pip install pytest pytest-asyncio
+pytest tests/ -v
 ```
 
 ---
