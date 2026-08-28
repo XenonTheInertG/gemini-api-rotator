@@ -3,7 +3,7 @@ requires      = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name        = "gemini-rotator"
+name        = "gemini-api-rotator"
 version     = "2.0.0"
 description = "Production-grade Gemini API key rotation with cooldown, exponential backoff, RPM tracking, and persistent stats."
 readme      = "README.md"
