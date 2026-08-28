@@ -3,7 +3,7 @@
 Production-grade Gemini API key rotation with automatic rate-limit handling, exponential backoff, per-key RPM tracking, per-request latency stats, and optional persistence.
 
 ```bash
-pip install gemini-rotator
+pip install gemini-api-rotator
 ```
 
 ---
@@ -24,16 +24,16 @@ Key design goals:
 
 ```bash
 # Core library only (no dependencies)
-pip install gemini-rotator
+pip install gemini-api-rotator
 
 # With google-genai so you can use execute()
-pip install "gemini-rotator[genai]"
+pip install "gemini-api-rotator[genai]"
 
 # With MongoDB adapter
-pip install "gemini-rotator[mongo]"
+pip install "gemini-api-rotator[mongo]"
 
 # Everything
-pip install "gemini-rotator[all]"
+pip install "gemini-api-rotator[all]"
 ```
 
 ---
